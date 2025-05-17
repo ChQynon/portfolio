@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server"
+import axios from "axios"
+import axiosRetry from "axios-retry"
 
 const CLIENT_ID = "cc76b4a40cdf4265891f386e6e5153f9"
 const CLIENT_SECRET = "f5826f2f802c4453a495f88c98835a13"
@@ -9,37 +11,41 @@ const NOW_PLAYING_ENDPOINT = "https://api.spotify.com/v1/me/player/currently-pla
 const RECENTLY_PLAYED_ENDPOINT = "https://api.spotify.com/v1/me/player/recently-played?limit=1"
 const TOKEN_ENDPOINT = "https://accounts.spotify.com/api/token"
 
+// Configure axios with retry mechanism
+const client = axios.create()
+axiosRetry(client, { 
+  retries: 3,
+  retryDelay: axiosRetry.exponentialDelay,
+  retryCondition: (error) => {
+    return axiosRetry.isNetworkOrIdempotentRequestError(error) || error.code === 'ECONNABORTED'
+  }
+})
+
 const getAccessToken = async () => {
   if (!REFRESH_TOKEN) {
     throw new Error("No refresh token available")
   }
 
   try {
-    // Можно также использовать предоставленный Access Token напрямую
-    // const accessToken = "BQDhupxU7XALnDMna9zZL_9Q0VSMXzKjLu1Bdsstf_2PmhLG2fyFede_3EAzMXTpC6_7DlOVNnpEAm7VlMvDEVO1QdhJ3mtkjkH3T5VDhHjeHy9DiTk77Qan-PHA88RGmpO0ib4GT1ndQoy5NfwloqpX547MKeATAYL2xvL8tqalRhSFGgpw0-JDUBEbwpfKzjGnJbY2eK18dosNkUbxT-jlvslyV0ZY4Czhr0E4dM-krz5lyoiYYw";
-    // return { access_token: accessToken };
-    
-    const response = await fetch(TOKEN_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${basic}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
+    const response = await client.post(TOKEN_ENDPOINT, 
+      new URLSearchParams({
         grant_type: "refresh_token",
         refresh_token: REFRESH_TOKEN,
-      }),
-      cache: "no-store",
-    })
+      }).toString(),
+      {
+        headers: {
+          Authorization: `Basic ${basic}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        }
+      }
+    )
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`Token request failed: ${response.status} - ${errorText}`)
-    }
-
-    return response.json()
+    return response.data
   } catch (error) {
     console.error("Error getting access token:", error)
+    if (axios.isAxiosError(error)) {
+      throw new Error(`Failed to get access token: ${error.message}`)
+    }
     throw error
   }
 }
@@ -56,83 +62,66 @@ const getNowPlaying = async () => {
 
     // First try to get currently playing
     console.log("Fetching currently playing...")
-    const response = await fetch(NOW_PLAYING_ENDPOINT, {
-      headers: {
-        Authorization: `Bearer ${access_token}`,
-      },
-      cache: "no-store",
-    })
-
-    console.log("Now playing response status:", response.status)
-
-    // If no current track, try to get recently played
-    if (response.status === 204 || response.status > 400) {
-      console.log("No current track, fetching recently played...")
-      const recentlyPlayed = await fetch(RECENTLY_PLAYED_ENDPOINT, {
+    try {
+      const response = await client.get(NOW_PLAYING_ENDPOINT, {
         headers: {
           Authorization: `Bearer ${access_token}`,
-        },
-        cache: "no-store",
+        }
       })
 
-      console.log("Recently played response status:", recentlyPlayed.status)
-
-      if (recentlyPlayed.status === 200) {
-        const data = await recentlyPlayed.json()
-        console.log("Recently played data:", JSON.stringify(data).substring(0, 200) + "...")
-
-        if (data && data.items && data.items.length > 0) {
-          const item = data.items[0].track
-          return {
-            isPlaying: false,
-            title: item.name,
-            artist: item.artists.map((_artist: any) => _artist.name).join(", "),
-            album: item.album.name,
-            albumImageUrl: item.album.images[0]?.url,
-            songUrl: item.external_urls.spotify,
-            isRecent: true,
-          }
+      if (response.data && response.data.item) {
+        const song = response.data
+        return {
+          isPlaying: song.is_playing,
+          title: song.item.name,
+          artist: song.item.artists.map((_artist: any) => _artist.name).join(", "),
+          album: song.item.album.name,
+          albumImageUrl: song.item.album.images[0]?.url,
+          songUrl: song.item.external_urls.spotify,
         }
-      } else {
-        const errorText = await recentlyPlayed.text()
-        console.error("Recently played error:", errorText)
-        return { isPlaying: false, error: `Recently played request failed: ${recentlyPlayed.status}` }
       }
-
-      return { isPlaying: false }
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status !== 204) {
+        console.error("Error fetching now playing:", error)
+      }
     }
 
-    if (response.status !== 200) {
-      const errorText = await response.text()
-      console.error("Now playing error:", errorText)
-      return { isPlaying: false, error: `Now playing request failed: ${response.status}` }
+    // If no current track, try to get recently played
+    console.log("Fetching recently played...")
+    try {
+      const recentlyPlayed = await client.get(RECENTLY_PLAYED_ENDPOINT, {
+        headers: {
+          Authorization: `Bearer ${access_token}`,
+        }
+      })
+
+      if (recentlyPlayed.data && recentlyPlayed.data.items && recentlyPlayed.data.items.length > 0) {
+        const item = recentlyPlayed.data.items[0].track
+        return {
+          isPlaying: false,
+          title: item.name,
+          artist: item.artists.map((_artist: any) => _artist.name).join(", "),
+          album: item.album.name,
+          albumImageUrl: item.album.images[0]?.url,
+          songUrl: item.external_urls.spotify,
+          isRecent: true,
+        }
+      }
+    } catch (error) {
+      console.error("Error fetching recently played:", error)
+      if (axios.isAxiosError(error)) {
+        throw new Error(`Failed to fetch recently played: ${error.message}`)
+      }
+      throw error
     }
 
-    const song = await response.json()
-    console.log("Now playing data:", JSON.stringify(song).substring(0, 200) + "...")
-
-    if (!song.item) {
-      return { isPlaying: false, error: "No item in response" }
-    }
-
-    const isPlaying = song.is_playing
-    const title = song.item.name
-    const artist = song.item.artists.map((_artist: any) => _artist.name).join(", ")
-    const album = song.item.album.name
-    const albumImageUrl = song.item.album.images[0]?.url
-    const songUrl = song.item.external_urls.spotify
-
-    return {
-      album,
-      albumImageUrl,
-      artist,
-      isPlaying,
-      songUrl,
-      title,
-    }
+    return { isPlaying: false }
   } catch (error) {
-    console.error("Error fetching now playing:", error)
-    return { isPlaying: false, error: String(error) }
+    console.error("Error in getNowPlaying:", error)
+    return { 
+      isPlaying: false, 
+      error: error instanceof Error ? error.message : "An unexpected error occurred"
+    }
   }
 }
 
@@ -144,6 +133,9 @@ export async function GET() {
     return NextResponse.json(response)
   } catch (error) {
     console.error("Unhandled error in Spotify API route:", error)
-    return NextResponse.json({ isPlaying: false, error: String(error) }, { status: 500 })
+    return NextResponse.json({ 
+      isPlaying: false, 
+      error: error instanceof Error ? error.message : "An unexpected error occurred" 
+    }, { status: 500 })
   }
 }

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useCallback } from "react"
 import { Music, Clock, ExternalLink } from "lucide-react"
 import Image from "next/image"
 
@@ -15,15 +15,19 @@ type NowPlayingResponse = {
   error?: string
 }
 
+const MAX_RETRIES = 3
+const RETRY_DELAY = 2000 // 2 seconds
+
 export default function NowPlaying() {
   const [data, setData] = useState<NowPlayingResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [retryCount, setRetryCount] = useState(0)
 
-  const fetchNowPlaying = async () => {
+  const fetchNowPlaying = useCallback(async (retry = 0) => {
     try {
       setLoading(true)
-      const timestamp = new Date().getTime() // Add timestamp to prevent caching
+      const timestamp = new Date().getTime()
       const res = await fetch(`/api/spotify?t=${timestamp}`, {
         cache: "no-store",
         next: { revalidate: 0 },
@@ -34,36 +38,45 @@ export default function NowPlaying() {
       }
 
       const data = await res.json()
-      console.log("Spotify data:", data) // Debug log
+      console.log("Spotify data:", data)
 
       if (data.error) {
-        setError(data.error)
-      } else {
-        setError(null)
+        throw new Error(data.error)
       }
 
+      setError(null)
       setData(data)
+      setRetryCount(0) // Reset retry count on success
     } catch (error) {
       console.error("Error fetching now playing:", error)
-      setError(String(error))
+      const errorMessage = error instanceof Error ? error.message : "An unexpected error occurred"
+      
+      if (retry < MAX_RETRIES) {
+        console.log(`Retrying... Attempt ${retry + 1} of ${MAX_RETRIES}`)
+        setRetryCount(retry + 1)
+        setTimeout(() => fetchNowPlaying(retry + 1), RETRY_DELAY)
+      } else {
+        setError(errorMessage)
+        setRetryCount(0)
+      }
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     fetchNowPlaying()
 
     // Refresh every 15 seconds
-    const interval = setInterval(fetchNowPlaying, 15000)
+    const interval = setInterval(() => fetchNowPlaying(), 15000)
     return () => clearInterval(interval)
-  }, [])
+  }, [fetchNowPlaying])
 
   return (
     <div className="max-w-3xl w-full mx-auto px-4 mb-12">
       <div
         className="card-gradient border border-gray-800 rounded-lg p-6 transition-all duration-300 hover:border-primary/50"
-        onClick={fetchNowPlaying}
+        onClick={() => fetchNowPlaying()}
       >
         <div className="flex items-center">
           {loading ? (
@@ -122,11 +135,16 @@ export default function NowPlaying() {
                         <Music className="w-4 h-4 text-primary" />
                       </div>
                       <div>
-                        <p className="text-sm font-medium">Сейчас ничего не играет</p>
-                        <p className="text-xs text-gray-400">Тут мог быть классный исполнитель</p>
+                        <p className="text-sm font-medium">Nothing playing right now</p>
+                        <p className="text-xs text-gray-400">No track information available</p>
                       </div>
                     </div>
-                    {error && <p className="text-xs text-red-400 mt-2 truncate">Ошибка: {error}</p>}
+                    {error && (
+                      <p className="text-xs text-red-400 mt-2 truncate">
+                        Error: {error}
+                        {retryCount > 0 && ` (Retry ${retryCount}/${MAX_RETRIES})`}
+                      </p>
+                    )}
                   </>
                 )}
               </div>
